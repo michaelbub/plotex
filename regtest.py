@@ -36,6 +36,12 @@ import subprocess
 import re
 import types
 
+from colorama import init as colorama_init
+from colorama import Fore
+from colorama import Style
+
+colorama_init()
+
 gamefile = None
 terppath = None
 terpargs = []
@@ -102,6 +108,7 @@ class RegTest:
         self.terp = None       # global terppath, terpargs
         self.precmd = None
         self.cmds = []
+        self.failed = False
     def __repr__(self):
         return '<RegTest %s>' % (self.name,)
     def addcmd(self, cmd):
@@ -186,8 +193,9 @@ class Command:
         self.checks = []
     def __repr__(self):
         return '<Command "%s">' % (self.cmd,)
-    def addcheck(self, ln):
+    def addcheck(self, ln, linenum):
         args = {}
+        args['linenum'] = linenum
         # First peel off "!" and "{...}" prefixes
         while True:
             match = re.match('!|{[a-z]*}', ln)
@@ -245,6 +253,7 @@ class Check:
         self.instatus = args.get('instatus', False)
         self.ingraphics = args.get('ingraphics', False)
         self.vital = args.get('vital', False) or opts.vital
+        self.linenum = args.get('linenum')
         self.ln = ln
         
     def __repr__(self):
@@ -257,10 +266,17 @@ class Check:
         if self.ingraphics:
             invflag += '{graphics}'
         detail = self.reprdetail()
-        return '<%s %s%s"%s">' % (self.__class__.__name__, detail, invflag, val,)
+        return 'Line %3d <%s %s%s"%s">' % (self.linenum, self.__class__.__name__, detail, invflag, val,)
 
     def reprdetail(self):
         return ''
+
+    def _to_str(self, lines, width=80):
+        import textwrap
+        txt = ''.join(map(textwrap.dedent, filter(lambda line: line != '' and line != '>', lines)))
+        if len(txt) > width:
+            return textwrap.shorten(txt, width)
+        return txt
 
     def eval(self, state):
         if not self.inrawdata:
@@ -283,7 +299,7 @@ class Check:
         else:
             if res:
                 return
-            return 'inverse test should fail'
+            return 'found: "' + self._to_str(lines)+"'"
     def subeval(self, lines):
         return 'not implemented'
 
@@ -299,7 +315,7 @@ class RegExpCheck(Check):
         for ln in lines:
             if re.search(self.ln, ln):
                 return
-        return 'not found'
+        return 'found: "' + self._to_str(lines)+"'"
         
 class LiteralCheck(Check):
     """A Check which looks for a literal string match in the output.
@@ -312,7 +328,7 @@ class LiteralCheck(Check):
         for ln in lines:
             if self.ln in ln:
                 return
-        return 'not found'
+        return 'found: "' + self._to_str(lines)+"'"
 
 class LiteralCountCheck(Check):
     """A Check which looks for a literal string match in the output,
@@ -1033,7 +1049,9 @@ def parse_tests(filename):
     curtest = None
     curcmd = None
 
+    linenum = 0
     while True:
+        linenum += 1
         ln = fl.readline()
         if (not ln):
             break
@@ -1091,7 +1109,7 @@ def parse_tests(filename):
             curtest.addcmd(curcmd)
             continue
 
-        curcmd.addcheck(ln)
+        curcmd.addcheck(ln, linenum)
 
     fl.close()
 
@@ -1129,7 +1147,6 @@ def run(test):
     if (test.terp):
         testterppath, testterpargs = test.terp
     
-    print('* ' + test.name)
     args = [ testterppath ] + testterpargs + [ testgamefile ]
     proc = None
     if terpformat != 'remsingle':
@@ -1157,6 +1174,7 @@ def run(test):
             for check in test.precmd.checks:
                 res = check.eval(gamestate)
                 if (res):
+                    test.failed = True
                     totalerrors += 1
                     val = '*** ' if opts.verbose else ''
                     print('%s%s: %s' % (val, check, res))
@@ -1178,6 +1196,7 @@ def run(test):
             for check in cmd.checks:
                 res = check.eval(gamestate)
                 if (res):
+                    test.failed = True
                     totalerrors += 1
                     val = '*** ' if opts.verbose else ''
                     print('%s%s: %s' % (val, check, res))
@@ -1188,6 +1207,7 @@ def run(test):
         # An error has already been logged; just fall out.
         pass
     except Exception as ex:
+        test.failed = True
         totalerrors += 1
         val = '*** ' if opts.verbose else ''
         print('%s%s: %s' % (val, ex.__class__.__name__, ex))
@@ -1248,6 +1268,7 @@ if (opts.precommands):
         precommands.append(Command(cmd))
 
 testcount = 0
+testfails = 0
 for test in testls:
     use = False
     for pat in testnames:
@@ -1261,11 +1282,20 @@ for test in testls:
         if (opts.listonly):
             print(test.name)
         else:
+            print()
+            print(f'{Fore.GREEN}[ RUN  ]{Style.RESET_ALL} %s' % (test.name,))
             run(test)
+            if test.failed:
+                testfails += 1
+                print(f'{Fore.RED}[FAILED]{Style.RESET_ALL} %s' % (test.name,))
+            else:
+                print(f'{Fore.GREEN}[   OK ]{Style.RESET_ALL} %s' % (test.name,))
 
-if (not testcount):
-    print('No tests performed!')
-if (totalerrors):
-    print()
-    print('FAILED: %d errors' % (totalerrors,))
+print()
+print('[======] %d tests ran.' % (testcount,))
+if (testfails):
+    print(f'{Fore.RED}[FAILED]{Style.RESET_ALL} %d tests failed.' % (testfails,))
+    print(f'{Fore.RED}[FAILED]{Style.RESET_ALL} %d checks failed.' % (totalerrors,))
     sys.exit(1)
+else:
+    print(f'{Fore.GREEN}[PASSED]{Style.RESET_ALL} %d tests passed.' % (testcount,))
