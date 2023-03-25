@@ -35,6 +35,7 @@ import fnmatch
 import subprocess
 import re
 import types
+import re
 
 from colorama import init as colorama_init
 from colorama import Fore
@@ -88,6 +89,9 @@ popt.add_option('--vital',
 popt.add_option('-v', '--verbose',
                 action='count', dest='verbose', default=0,
                 help='display the transcripts as they run')
+popt.add_option('-x', '--failure',
+                action='store_true', dest='failure',
+                help='only display failures')
 
 (opts, args) = popt.parse_args()
 
@@ -108,7 +112,7 @@ class RegTest:
         self.terp = None       # global terppath, terpargs
         self.precmd = None
         self.cmds = []
-        self.failed = False
+        self.failures = []
     def __repr__(self):
         return '<RegTest %s>' % (self.name,)
     def addcmd(self, cmd):
@@ -255,7 +259,7 @@ class Check:
         self.vital = args.get('vital', False) or opts.vital
         self.linenum = args.get('linenum')
         self.ln = ln
-        
+
     def __repr__(self):
         val = self.ln
         if len(val) > 32:
@@ -268,13 +272,27 @@ class Check:
         detail = self.reprdetail()
         return 'Line %3d <%s %s%s"%s">' % (self.linenum, self.__class__.__name__, detail, invflag, val,)
 
+    def state(self):
+        val = self.ln
+        if len(val) > 32:
+            val = val[:32] + '...'
+        invflag = '!' if self.inverse else ''
+        if self.instatus:
+            invflag += '{status}'
+        if self.ingraphics:
+            invflag += '{graphics}'
+        detail = self.reprdetail()
+        return (self.linenum, self.__class__.__name__, detail, invflag, val)
+
     def reprdetail(self):
         return ''
 
-    def _to_str(self, lines, width=80):
-        import textwrap
-        txt = ''.join(map(textwrap.dedent, filter(lambda line: line != '' and line != '>', lines)))
+    def _to_str(self, lines, width=999):
+        ignore = re.compile(" *|>")
+        filtered = filter(lambda line: not ignore.fullmatch(line), lines)
+        txt = '|'.join(map(lambda line: line.strip(), filtered))
         if len(txt) > width:
+            import textwrap
             return textwrap.shorten(txt, width)
         return txt
 
@@ -299,7 +317,7 @@ class Check:
         else:
             if res:
                 return
-            return 'found: "' + self._to_str(lines)+"'"
+            return self._to_str(lines)+"'"
     def subeval(self, lines):
         return 'not implemented'
 
@@ -315,7 +333,7 @@ class RegExpCheck(Check):
         for ln in lines:
             if re.search(self.ln, ln):
                 return
-        return 'found: "' + self._to_str(lines)+"'"
+        return self._to_str(lines)+"'"
         
 class LiteralCheck(Check):
     """A Check which looks for a literal string match in the output.
@@ -328,7 +346,7 @@ class LiteralCheck(Check):
         for ln in lines:
             if self.ln in ln:
                 return
-        return 'found: "' + self._to_str(lines)+"'"
+        return self._to_str(lines)+"'"
 
 class LiteralCountCheck(Check):
     """A Check which looks for a literal string match in the output,
@@ -1154,7 +1172,7 @@ def run(test):
             args,
             env=terpenv,
             bufsize=0,
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
 
     if terpformat == 'cheap':
         gamestate = GameStateCheap(proc.stdin, proc.stdout)
@@ -1174,13 +1192,11 @@ def run(test):
             for check in test.precmd.checks:
                 res = check.eval(gamestate)
                 if (res):
-                    test.failed = True
                     totalerrors += 1
-                    val = '*** ' if opts.verbose else ''
-                    print('%s%s: %s' % (val, check, res))
+                    test.failures.append((test.precmd, check.state() + (res,)))
                     if check.vital:
                         raise VitalCheckException()
-    
+
         for cmd in cmdlist:
             if (opts.verbose):
                 if cmd.type == 'line':
@@ -1196,10 +1212,8 @@ def run(test):
             for check in cmd.checks:
                 res = check.eval(gamestate)
                 if (res):
-                    test.failed = True
                     totalerrors += 1
-                    val = '*** ' if opts.verbose else ''
-                    print('%s%s: %s' % (val, check, res))
+                    test.failures.append((cmd, check.state() + (res,)))
                     if check.vital:
                         raise VitalCheckException()
 
@@ -1207,10 +1221,8 @@ def run(test):
         # An error has already been logged; just fall out.
         pass
     except Exception as ex:
-        test.failed = True
         totalerrors += 1
-        val = '*** ' if opts.verbose else ''
-        print('%s%s: %s' % (val, ex.__class__.__name__, ex))
+        test.failures.append((None, check.state() + (ex.__class__.__name__, ex)))
 
     gamestate = None
     if proc:
@@ -1218,8 +1230,8 @@ def run(test):
         proc.stdout.close()
         proc.kill()
         proc.poll()
-    
-    
+
+
 checkclasses.append(RegExpCheck)
 checkclasses.append(LiteralCountCheck)
 checkclasses.append(HyperlinkSpanCheck)
@@ -1282,20 +1294,30 @@ for test in testls:
         if (opts.listonly):
             print(test.name)
         else:
-            print()
-            print(f'{Fore.GREEN}[ RUN  ]{Style.RESET_ALL} %s' % (test.name,))
             run(test)
-            if test.failed:
+            if test.failures:
                 testfails += 1
+                print(f'{Fore.GREEN}[ RUN  ]{Style.RESET_ALL} %s' % (test.name,))
+                for (cmd, failure) in test.failures:
+                    if len(failure) == 6:
+                        print(f"Line {failure[0]} Failure\nCommand : {cmd}\nExpected: {failure[1]} {failure[2]}{failure[3]}{failure[4]}\nActual  : {failure[5]}")
+                    else:
+                        print(f"Line {failure[0]} Failure\nCommand : {cmd}\nExpected: {failure[1]} {failure[2]}{failure[3]}{failure[4]}\nActual  : {failure[5]} {failure[6]}")
                 print(f'{Fore.RED}[FAILED]{Style.RESET_ALL} %s' % (test.name,))
             else:
-                print(f'{Fore.GREEN}[   OK ]{Style.RESET_ALL} %s' % (test.name,))
+                if not opts.failure:
+                    print(f'{Fore.GREEN}[ RUN  ]{Style.RESET_ALL} %s' % (test.name,))
+                    print(f'{Fore.GREEN}[   OK ]{Style.RESET_ALL} %s' % (test.name,))
 
 print()
-print('[======] %d tests ran.' % (testcount,))
+print(f"[======] {testcount} test{'s'[:testcount^1]} ran.")
 if (testfails):
-    print(f'{Fore.RED}[FAILED]{Style.RESET_ALL} %d tests failed.' % (testfails,))
-    print(f'{Fore.RED}[FAILED]{Style.RESET_ALL} %d checks failed.' % (totalerrors,))
+    print(f"{Fore.RED}[FAILED]{Style.RESET_ALL} {testfails} test{'s'[:testcount^1]} failed, listed below:")
+    for test in testls:
+        if test.failures: print(f'{Fore.RED}[FAILED]{Style.RESET_ALL} %s' % (test.name,))
+    print(f"{Fore.RED}[FAILED]{Style.RESET_ALL} {totalerrors} check{'s'[:totalerrors^1]} failed.")
+    print()
+    print(f"{testfails} FAILED TEST{'S'[:testfails^1]}")
     sys.exit(1)
 else:
-    print(f'{Fore.GREEN}[PASSED]{Style.RESET_ALL} %d tests passed.' % (testcount,))
+    print(f"{Fore.GREEN}[PASSED]{Style.RESET_ALL} {testcount} test{'s'[:testcount^1]} passed.")
